@@ -1,18 +1,23 @@
 // ==UserScript==
 // @name         Amq Autocomplete improvement
 // @namespace    http://tampermonkey.net/
-// @version      1.16
+// @version      1.22
 // @description  faster and better autocomplete
 // First searches for text startingWith, then includes and finally if input words match words in anime (in any order). Special characters can be in any place in any order
 // @author       Juvian
 // @match        https://animemusicquiz.com/*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/fuzzyset.js/0.0.8/fuzzyset.min.js
 // @grant        none
 // @copyright MIT license
 // ==/UserScript==
 
 let isNode = typeof window === 'undefined';
 
-if (!isNode && typeof Listener === 'undefined') return;
+if (!isNode && typeof Listener === 'undefined') throw "rip";
+
+if (isNode) {
+	FuzzySet = require('fuzzyset.js')
+}
 
 var options = {
 	highlight: true, // highlight or not the match
@@ -20,7 +25,13 @@ var options = {
     sortList: true, // true = consider matching animes by last seen order (after checking startsWith)
 	allowRightLeftArrows: false, // use right and left arrows to move dropdown selected options
 	allowStartsWith: true, // allow startsWith priotization (fastest matching)
-	allowDifferentOrder: true // allow the words to be on any order (no hero boku will match boku no hero)
+	allowDifferentOrder: true, // allow the words to be on any order (no hero boku will match boku no hero),
+	daysToRemember: 90, // sets amount of days to consider an anime as seen in sorting,
+	fuzzy: {
+		dropdown: true, // whether to show fuzzy matches if no matches found
+		answer: true, // whether to use top fuzzy match on round end as answer if no matches found
+	},
+	addEntries: true // whether to allow oo, ou and uu as ō/ū
 }
 
 var debug = false;
@@ -32,7 +43,7 @@ function log(msg) {
 var storedData = {}
 
 if (!isNode && window.localStorage) {
-    storedData = JSON.parse(localStorage.getItem("storedData") || "{}")
+    storedData = JSON.parse(localStorage.getItem("storedData") || "{}");
 }
 
 class FilterManager {
@@ -40,31 +51,76 @@ class FilterManager {
 		this.list = list.filter(v => v.trim().length).map((v, idx) => ({str: this.cleanString(v), idx: idx, specialStr: this.onlySpecialChars(v), splittedStr: this.cleanString(v).split(" "), originalStr: v}));
 		this.limit = limit
 		this.specialChars = {}
+        this.now = new Date(); this.now.setDate(this.now.getDate() - options.daysToRemember);
+
+		this.addEntries();
+		this.list.forEach(v=> v.originalIndex = v.idx);
 
 		if (options.sortList) {
             this.list = this.sortBySeen(this.list);
 		}
 
+		this.list.forEach((v, idx) => v.idx = idx);
+
 		this.sorted = {
-			list: this.alphabeticalSort(this.list.map(v => ({value: v.str, idx: v.idx})))
+			list: this.alphabeticalSort(this.list.map(v => ({str: v.str, idx: v.idx})))
 		};
+
+		if (options.fuzzy.dropdown || options.fuzzy.answer) {
+			this.fuzzy = FuzzySet(this.sorted.list.map(v => v.str));
+			this.reverseMapping = {}
+			this.sorted.list.forEach(v => {
+				this.reverseMapping[v.str] = this.reverseMapping[v.str] || []
+				this.reverseMapping[v.str].push(v.idx)
+			});
+		}
 
 		this.superString = this.list.map(v => v.str).join("$$$");
 
-		this.superStringLookup = [{value: 0}];
+		this.superStringLookup = [{str: 0}];
 
 		for (var i = 0; i < this.list.length; i++) {
-			this.superStringLookup.push({value: this.superStringLookup[i].value + this.list[i].str.length + 3})
+			this.superStringLookup.push({str: this.superStringLookup[i].str + this.list[i].str.length + 3})
 		}
 
 		this.lastQry = "";
 		this.lastSpecialStr = "";
 		this.results = new Set();
+		this.originalIndexResults = new Set();
+
+		this.partialContext = {limit: limit, superString: this.superString, superStringLookup: this.superStringLookup, first: this.first}
+		this.partialContext.addResult = (idx) => {
+			if (this.partialMatches(idx)) this.addResult(idx);
+		}
+
 		this.reset();
 	}
 
+	addEntries() {
+		if (!options.addEntries) return;
+
+        this.list.filter(e => e.originalStr.includes('ō') || e.originalStr.includes('ū')).forEach(e => {
+            let additional = [""];
+			for (let i = 0; i < e.originalStr.length; i++) {
+			    if (e.originalStr[i] == 'ō') {
+				   additional = additional.map(s => s + 'oo').concat(additional.map(s => s + 'ou'));
+				} else if (e.originalStr[i] == 'ū') {
+                   additional = additional.map(s => s + 'uu');
+				} else {
+				   additional = additional.map(s => s + e.originalStr[i]);
+				}
+			}
+			this.list = this.list.concat(additional.map((v, idx) => ({str: this.cleanString(v), idx: e.idx, specialStr: this.onlySpecialChars(v), splittedStr: this.cleanString(v).split(" "), originalStr: e.originalStr})));
+		});
+	}
+
+	getLastSeen(anime) {
+		return storedData[anime.toLowerCase()] >= this.now.getTime() ? storedData[anime.toLowerCase()] : 1
+	}
+
+
 	sortBySeen(arr) {
-       return arr.map((v) => ({val : v, d: (storedData[v.originalStr.toLowerCase()] || 1)})).sort(function(a, b){
+       return arr.map((v) => ({val : v, d: this.getLastSeen(v.originalStr)})).sort(function(a, b){
 	       if (a.d < b.d) return 1;
 		   if (b.d < a.d) return -1;
 		   if (a.val.idx < b.val.idx) return -1;
@@ -77,7 +133,7 @@ class FilterManager {
 	}
 
 	onlySpecialChars(str) {
-	    return removeDiacritics(str).replace(/[\w\s]/gi, '').split('').sort().join('');
+	    return str.replace(/[\w\s]/gi, '').split('').sort().join('');
 	}
 
 	alphabeticalSort (list) {
@@ -95,8 +151,10 @@ class FilterManager {
 		this.sorted.end = this.sorted.list.length;
 
 		this.lastIndex = 0;
-		this.lastPartialIndex = 0;
 		this.results.clear()
+		this.originalIndexResults.clear();
+		this.partialContext.lastIndex = 0;
+		this.lastSpecialIndex = 0
 	}
 
 	checkOldResults () {
@@ -108,12 +166,14 @@ class FilterManager {
 		}
 
         this.results = new Set();
+        this.originalIndexResults = new Set();
+
 		results.forEach(idx => this.addResult(idx));
 	}
 
 
 
-	processResultsFor(str) {
+	processResultsFor(str, fuzzy) {
 		let specialStr = this.onlySpecialChars(str);
 		str = this.cleanString(str);
 
@@ -132,15 +192,23 @@ class FilterManager {
 
 			this.addContainingResults();
 
-			if (options.allowDifferentOrder) {
-				for (; this.lastPartialIndex < this.list.length && this.results.size < this.limit; this.lastPartialIndex++) {
-					if (this.partialMatches(this.lastPartialIndex)) this.addResult(this.lastPartialIndex);
-				}
+			if (options.allowDifferentOrder && this.lastQrySplit.length >= 2) {
+				this.partialContext.lastQry = this.lastQrySplit.sort((a, b) => b.length - a.length)[0];
+				this.partialContext.results = this.results;
+				this.partialContext.originalIndexResults = this.originalIndexResults;
+				this.addContainingResults.call(this.partialContext);
 			}
 		} else if (this.lastSpecialStr.length) {
-			for (; this.lastPartialIndex < this.list.length && this.results.size < this.limit; this.lastPartialIndex++) {
-				this.addResult(this.lastPartialIndex);
+			for (; this.lastSpecialIndex < this.list.length && this.originalIndexResults.size < this.limit; this.lastSpecialIndex++) {
+				this.addResult(this.lastSpecialIndex);
 			}
+		}
+
+		this.fuzzySearched = this.results.size == 0 && fuzzy;
+
+		if (this.fuzzySearched) {
+			this.results = new Set((this.fuzzy.get(str) || []).slice(0, this.limit).map(r => this.reverseMapping[r[1]]).reduce((acc, val) => acc.concat(val), []).slice(0, this.limit));
+			this.originalIndexResults = new Set(Array.from(this.results).map(idx => this.list[idx].originalIndex));
 		}
 	}
 
@@ -149,7 +217,7 @@ class FilterManager {
 		re.lastIndex = this.lastIndex
 		var match;
 
-		while (this.results.size < this.limit && (match = re.exec(this.superString))) {
+		while (this.originalIndexResults.size < this.limit && (match = re.exec(this.superString))) {
    			var idx = this.first(this.superStringLookup, v => v > match.index, 0, this.superStringLookup.length) - 1
    			this.addResult(idx);
    			this.lastIndex = re.lastIndex
@@ -179,11 +247,9 @@ class FilterManager {
 	specialMatchesStr(qry, strToMatch) {
 	    let curIdx = 0;
 
-		for (let i = 0; strToMatch && i < strToMatch.length && curIdx < qry.length; i++) {
+		for (let i = 0; strToMatch && i < strToMatch.length && curIdx < qry.length && strToMatch[i] <= qry[curIdx]; i++) {
 		    if (strToMatch[i] == qry[curIdx]) {
 			    curIdx++;
-			} else if (strToMatch[i] > qry[curIdx]) {
-			    break;
 			}
 		}
 
@@ -191,46 +257,58 @@ class FilterManager {
 	}
 
 	addResult(idx) {
-	    if (this.specialMatches(idx)) this.results.add(idx);
+	    if (this.specialMatches(idx)) {
+	    	this.results.add(idx);
+	    	this.originalIndexResults.add(this.list[idx].originalIndex)
+	    }
 	}
 
 	matches (currentIndex, matches, used) {
 		if (currentIndex == matches.length) return true;
 
-		var result = false;
-
 		for (var i = 0; i < matches[0].length; i++) {
 			if (!used[i] && matches[currentIndex][i]) {
 				used[i] = true;
-				result |= this.matches(currentIndex + 1, matches, used);
+				if (this.matches(currentIndex + 1, matches, used)) return true;
 				used[i] = false;
 			}
 		}
 
-		return result;
+		return false;
 
 	}
 
 	addResults (range) {
-		for (var i = range.first; i <= range.last && this.results.size < this.limit; i++) {
+		for (var i = range.first; i <= range.last && this.originalIndexResults.size < this.limit; i++) {
 			this.addResult(range.list[i].idx);
 		}
 	}
 
-	filterBy (str) {
-		//console.time(str + " filter")
+	filterBy (str, fuzzy) {
+		if(debug) console.time(str + " filter")
 
 		if (str.trim().length == 0) return [];
-		this.processResultsFor(str);
-		return Array.from(this.results).map(idx => this.list[idx])
+		this.processResultsFor(str, fuzzy);
 
-		//console.timeEnd(str + " filter")
+		let results = [];
+		let s = new Set();
+
+		for (let idx of this.results) {
+			if (!s.has(this.list[idx].originalIndex)) {
+				results.push(this.list[idx]);
+				s.add(this.list[idx].originalIndex)
+			}
+		}
+
+		return results
+
+		if(debug) console.timeEnd(str + " filter")
 	}
 
 	range (data) {
 		var first = this.first(data.list, f => f >= this.lastQry, data.start, data.end);
 
-		if (first < data.end && data.list[first].value.startsWith(this.lastQry)) {
+		if (first < data.end && data.list[first].str.startsWith(this.lastQry)) {
 			return {
 				first: first,
 				last: this.first(data.list, f => !f.startsWith(this.lastQry), first, data.end) - 1,
@@ -248,7 +326,7 @@ class FilterManager {
 	first(array, pred, lo, hi) {
 	    while (lo != hi) {
 	        const mi = lo + ((hi - lo) >> 1);
-	        if (pred(array[mi].value)) {
+	        if (pred(array[mi].str)) {
 	            hi = mi;
 	        } else {
 	            lo = mi + 1;
@@ -273,7 +351,7 @@ if (!isNode) {
 
 	AmqAwesomeplete = function(input, o) {
 		oldProto.constructor.apply(this, Array.from(arguments))
-		this.isAnimeAutocomplete = this._list.indexOf("Lain") != -1;
+		this.isAnimeAutocomplete = this._list.indexOf("Serial Experiments Lain") != -1;
 		if (this.isAnimeAutocomplete) this.preprocess();
 	}
 
@@ -294,11 +372,11 @@ if (!isNode) {
 	AmqAwesomeplete.prototype.evaluate = function () {
 		if (this.isAnimeAutocomplete == false) return oldEvaluate.call(this);
 
-		this.filterManager.filterBy(this.input.value);
+		this.suggestions = this.filterManager.filterBy(this.input.value, options.fuzzy.dropdown);
 
-		this.suggestions = this.filterManager.filterBy(this.input.value);
+		this.suggestions = this.suggestions.map((v) => ({v: v, d: this.filterManager.getLastSeen(v.originalStr)}));
 
-		this.suggestions = this.suggestions.map((v) => ({v: v, d: storedData[v.originalStr.toLowerCase()] || 1})).sort((a, b) => {
+		if (!this.filterManager.fuzzySearched) this.suggestions = this.suggestions.sort((a, b) => {
 			if (options.sorting == "partial" || options.sorting == "total") {
 				if (a.d != 1 && b.d == 1) return -1;
 				if (a.d == 1 && b.d != 1) return 1;
@@ -314,7 +392,9 @@ if (!isNode) {
 			}
 
 			return 1;
-		}).map(v => new Suggestion(this.data(v.v.originalStr, this.filterManager.lastQry)));
+		})
+
+		this.suggestions = this.suggestions.map(v => new Suggestion(this.data(v.v.originalStr, this.filterManager.lastQry)));
 
 		log(this.suggestions)
 
@@ -343,13 +423,14 @@ if (!isNode) {
 	};
 
 	//auto send incomplete answer
-	var oldSendAnwer = Quiz.prototype.sendAnswer;
+	var oldSendAnwer = QuizAnswerInput.prototype.submitAnswer;
 
-	Quiz.prototype.sendAnswer = function () {
+	QuizAnswerInput.prototype.submitAnswer = function () {
 	    try{
-			var awesome = quiz.autoCompleteController.awesomepleteInstance;
-			if(awesome && awesome.suggestions && awesome.suggestions.length && awesome.input.value.trim() && awesome.suggestions.every(s => awesome.filterManager.cleanString(s.value) != awesome.filterManager.cleanString(awesome.input.value))){
-				awesome.input.value = awesome.suggestions[0].value;
+			var awesome = this.autoCompleteController.awesomepleteInstance;
+
+			if(awesome && awesome.suggestions && awesome.input.value.trim() && awesome.suggestions.every(s => awesome.filterManager.cleanString(s.value) != awesome.filterManager.cleanString(awesome.input.value)) && (awesome.suggestions.length || (!options.fuzzy.dropdown && options.fuzzy.answer))) {
+				awesome.input.value = awesome.suggestions.length ? awesome.suggestions[0].value : awesome.filterManager.filterBy(awesome.input.value, true)[0].originalStr;
 			}
 		} catch (ex) {
 	        console.log(ex);
@@ -359,17 +440,8 @@ if (!isNode) {
 
 
 	new Listener("answer results", function (result) {
-		var rightAnswers = {}
-		if (result.players.filter(p => p.rightAnswer && p.name == selfName && (rightAnswers[p.answer.toLowerCase()] = true)).length == 0) {
-			result.players.forEach((playerResult) => {
-				if(playerResult.rightAnswer) {
-				    rightAnswers[playerResult.answer.toLowerCase()] = true;
-				}
-			});
-		}
-
-		for (var answer in rightAnswers) {
-		    storedData[answer] = new Date().getTime();
+		for (var lang in result.songInfo.animeNames) {
+		    storedData[result.songInfo.animeNames[lang].toLowerCase()] = new Date().getTime();
 		}
 
 		log(storedData)
@@ -472,12 +544,24 @@ var defaultDiacriticsRemovalMap = [
 
 var diacriticsMap = {};
 
-for (var i=0; i < defaultDiacriticsRemovalMap .length; i++){
-    var letters = defaultDiacriticsRemovalMap [i].letters;
+for (var i=0; i < defaultDiacriticsRemovalMap.length; i++){
+    var letters = defaultDiacriticsRemovalMap[i].letters;
     for (var j=0; j < letters.length ; j++){
-        diacriticsMap[letters[j]] = defaultDiacriticsRemovalMap [i].base;
+        diacriticsMap[letters[j]] = defaultDiacriticsRemovalMap[i].base;
     }
 }
+
+diacriticsMap["×"] = "x";
+diacriticsMap["³"] = "3";
+diacriticsMap["ß"] = "b";
+diacriticsMap["–"] = "-";
+diacriticsMap["²"] = "2";
+diacriticsMap["’"] = "'";
+diacriticsMap["@"] = "a";
+diacriticsMap["æ"] = "a";
+diacriticsMap["ñ"] = "n";
+
+
 
 // "what?" version ... http://jsperf.com/diacritics/12
 function removeDiacritics (str) {
@@ -487,20 +571,36 @@ function removeDiacritics (str) {
 }
 
 if (isNode) {
-	let l = new FilterManager(["asd", "asd!", "asd!!*hi"], 15);
+	storedData["oh my kokoro"] = new Date().getTime()
+
+	let l = new FilterManager(["o", "asd", "asd!", "asd!!*hi", "o", "tt", "oh my kokoro", "kokoro", "ktrōk"], 15);
 
 	escapeRegExp = (v) => v;
-	search = (str, len) => {
-		s = l.filterBy(str);
-		if (s.length != len) {
+	search = (str, len, first, fuzzy) => {
+		s = l.filterBy(str, fuzzy);
+		if (s.length != len || first !== s[0].originalStr) {
 			console.log(s, str, len)
 		}
+		return s
 	}
 
-	search("s", 3)
-	search("!s", 2)
-	search("*", 1)
-	search("*!", 1)
-	search("!*", 1)
-	search("!asd!*hi", 1)
+	expect = (s, str) => {
+		if (l.filterBy(s)[0] !== str) console.log(str)
+	}
+
+	search("s", 3, "asd")
+	search("!s", 2, "asd!")
+	search("*", 1, "asd!!*hi")
+	search("*!", 1, "asd!!*hi")
+	search("!*", 1, "asd!!*hi")
+	search("!asd!*hi", 1, "asd!!*hi")
+	search("ko", 2, "kokoro")
+	search("kororo", 2, "kokoro", true)
+	search("ads", 3, "asd", true)
+	search("ktr", 1, "ktrōk")
+
+	l = new FilterManager(["Kiss×sis"], 15)
+	search("kissx", 1, "Kiss×sis")
+
+	module.exports = {FilterManager}
 }
